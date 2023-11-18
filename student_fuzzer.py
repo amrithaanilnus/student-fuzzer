@@ -1,68 +1,305 @@
-from fuzzingbook import GreyboxFuzzer as gbf
-from fuzzingbook import Coverage as cv
-from fuzzingbook import MutationFuzzer as mf
+from typing import List, Set, Any, Tuple, Dict, Union
+from collections.abc import Sequence
 
-import traceback
-import numpy as np
-import time
+import random
 
+import sys
+sys.path.append('bug.py')
 from bug import entrypoint
 from bug import get_initial_corpus
 
-## You can re-implement the coverage class to change how
-## the fuzzer tracks new behavior in the SUT
+!pip install fuzzingbook
 
-# class MyCoverage(cv.Coverage):
-#
-#     def coverage(self):
-#         <your implementation here>
-#
-#     etc...
+from fuzzingbook.Coverage import population_coverage
 
+class Mutator:
+    """Mutate strings"""
 
-## You can re-implement the runner class to change how
-## the fuzzer tracks new behavior in the SUT
+    def __init__(self) -> None:
+        """Constructor"""
+        self.mutators = [
+            self.delete_random_character,
+            self.insert_random_character,
+            self.flip_random_character
+        ]
 
-# class MyRunner(mf.FunctionRunner):
-#
-#     def run_function(self, inp):
-#           <your implementation here>
-#
-#     def coverage(self):
-#           <your implementation here>
-#
-#     etc...
-
-
-## You can re-implement the fuzzer class to change your
-## fuzzer's overall structure
-
-# class MyFuzzer(gbf.GreyboxFuzzer):
-#
-#     def reset(self):
-#           <your implementation here>
-#
-#     def run(self, runner: gbf.FunctionCoverageRunner):
-#           <your implementation here>
-#   etc...
-
-## The Mutator and Schedule classes can also be extended or
-## replaced by you to create your own fuzzer!
+    def insert_random_character(self, s: str) -> str:
+        #print(s)
+        """Returns s with a random character inserted"""
+        pos = random.randint(0, len(s))
+        #print("position",pos)
+        random_character = chr(random.randrange(32, 127))
+        return s[:pos] + random_character + s[pos:]
 
 
-    
-# When executed, this program should run your fuzzer for a very 
-# large number of iterations. The benchmarking framework will cut 
-# off the run after a maximum amount of time
-#
-# The `get_initial_corpus` and `entrypoint` functions will be provided
-# by the benchmarking framework in a file called `bug.py` for each 
-# benchmarking run. The framework will track whether or not the bug was
-# found by your fuzzer -- no need to keep track of crashing inputs
+    def delete_random_character(self, s: str) -> str:
+        #print(s)
+        """Returns s with a random character deleted"""
+        if s == "":
+            return self.insert_random_character(s)
+
+        pos = random.randint(0, len(s) - 1)
+        #print("position",pos)
+        return s[:pos] + s[pos + 1:]
+
+    def flip_random_character(self, s: str) -> str:
+        #print(s)
+        """Returns s with a random bit flipped in a random position"""
+        if s == "":
+            return self.insert_random_character(s)
+
+        pos = random.randint(0, len(s) - 1)
+        #print("position",pos)
+        c = s[pos]
+        #print(c)
+        bit = 1 << random.randint(0, 6)
+        new_c = chr(ord(c) ^ bit)
+        return s[:pos] + new_c + s[pos + 1:]
+
+    def mutate(self, inp: Any) -> Any:  # can be str or Seed (see below)
+        """Return s with a random mutation applied. Can be overloaded in subclasses."""
+        mutator = random.choice(self.mutators)
+        return mutator(inp)
+
+
+
+from fuzzingbook.Coverage import Location
+
+class Seed:
+    """Represent an input with additional attributes"""
+
+    def __init__(self, data: str) -> None:
+        """Initialize from seed data"""
+        self.data = data
+
+        # These will be needed for advanced power schedules
+        self.coverage: Set[Location] = set()
+        self.distance: Union[int, float] = -1
+        self.energy = 0.0
+
+    def __str__(self) -> str:
+        """Returns data as string representation of the seed"""
+        return self.data
+
+    __repr__ = __str__
+
+class PowerSchedule:
+    """Define how fuzzing time should be distributed across the population."""
+
+    def __init__(self) -> None:
+        """Constructor"""
+        self.path_frequency: Dict = {}
+
+    def assignEnergy(self, population: Sequence[Seed]) -> None:
+        """Assigns each seed the same energy"""
+        for seed in population:
+            seed.energy = 1
+
+    def normalizedEnergy(self, population: Sequence[Seed]) -> List[float]:
+        """Normalize energy"""
+        energy = list(map(lambda seed: seed.energy, population))
+        sum_energy = sum(energy)  # Add up all values in energy
+        assert sum_energy != 0
+        norm_energy = list(map(lambda nrg: nrg / sum_energy, energy))
+        return norm_energy
+
+    def choose(self, population: Sequence[Seed]) -> Seed:
+        """Choose weighted by normalized energy."""
+
+        #self.assignEnergy(population)
+
+        norm_energy = self.normalizedEnergy(population)
+        #print(norm_energy)
+        seed: Seed = random.choices(population, weights=norm_energy)[0]
+        return seed
+
+from fuzzingbook.MutationFuzzer import FunctionCoverageRunner
+
+from fuzzingbook.Fuzzer import Fuzzer
+
+class AdvancedMutationFuzzer(Fuzzer):
+    """Base class for mutation-based fuzzing."""
+
+    def __init__(self, seeds: List[str],
+                 mutator: Mutator,
+                 schedule: PowerSchedule) -> None:
+        """Constructor.
+        `seeds` - a list of (input) strings to mutate.
+        `mutator` - the mutator to apply.
+        `schedule` - the power schedule to apply.
+        """
+
+        self.seeds = seeds
+        self.mutator = mutator
+        self.schedule = schedule
+        self.inputs: List[str] = []
+        self.reset()
+
+    def reset(self) -> None:
+        """Reset the initial population and seed index"""
+        self.population = list(map(lambda x: Seed(x), self.seeds))
+        #print("population",self.population)
+        self.seed_index = 0
+
+    def create_candidate(self) -> str:
+        """Returns an input generated by fuzzing a seed in the population"""
+        seed = self.schedule.choose(self.population)
+        #print("33",seed)
+        # Stacking: Apply multiple mutations to generate the candidate
+        candidate = seed.data
+        energy = seed.energy  # Default to 1.0 if energy is not assigned
+        #print(seed,energy)
+        #trial1= min(len(candidate), int(energy * (1 << random.randint(1, 5))))
+
+        trials = min(len(candidate), 1 << random.randint(1, 5))
+        print(trials,trial1,len(candidate))
+        for i in range(trials):
+            candidate = self.mutator.mutate(candidate)
+        return candidate
+
+    def fuzz(self) -> str:
+        """Returns first each seed once and then generates new inputs"""
+        #print(self.seed_index,len(self.seeds))
+        if self.seed_index < len(self.seeds):
+            # Still seeding
+            self.inp = self.seeds[self.seed_index]
+            self.seed_index += 1
+        else:
+            # Mutating
+            self.inp = self.create_candidate()
+
+        self.inputs.append(self.inp)
+        return self.inp
+
+import time
+
+class GreyboxFuzzer(AdvancedMutationFuzzer):
+    """Coverage-guided mutational fuzzing."""
+
+    def reset(self):
+        """Reset the initial population, seed index, coverage information"""
+        super().reset()
+        self.coverages_seen = set()
+        self.population = []  # population is filled during greybox fuzzing
+
+    def run(self, runner: FunctionCoverageRunner) -> Tuple[Any, str]:
+        """Run function(inp) while tracking coverage.
+           If we reach new coverage,
+           add inp to population and its coverage to population_coverage
+        """
+        result, outcome = super().run(runner)
+        new_coverage = frozenset(runner.coverage())
+        if new_coverage not in self.coverages_seen:
+            # We have new coverage
+            seed = Seed(self.inp)
+            seed.coverage = runner.coverage()
+            self.coverages_seen.add(new_coverage)
+            self.population.append(seed)
+
+        return (result, outcome)
+
+import pickle   # serializes an object by producing a byte array from all the information in the object
+import hashlib
+
+def getPathID(coverage: Any) -> str:
+    """Returns a unique hash for the covered statements"""
+    pickled = pickle.dumps(sorted(coverage))
+    return hashlib.md5(pickled).hexdigest()
+
+class AFLFastSchedule:
+    """Exponential power schedule as implemented in AFL"""
+    def __init__(self, exponent: float) -> None:
+        self.path_frequency: Dict = {}
+        self.exponent = exponent
+
+
+    def assignEnergy(self, population: Sequence[Seed]) -> None:
+        """Assign exponential energy inversely proportional to path frequency"""
+        for seed in population:
+            seed.energy = 1 / (self.path_frequency[getPathID(seed.coverage)] ** self.exponent)
+            #print(seed.energy)
+
+    def normalizedEnergy(self, population: Sequence[Seed]) -> List[float]:
+        """Normalize energy"""
+        energy = list(map(lambda seed: seed.energy, population))
+        sum_energy = sum(energy)  # Add up all values in energy
+        assert sum_energy != 0
+        norm_energy = list(map(lambda nrg: nrg / sum_energy, energy))
+        return norm_energy
+
+    def choose(self, population: Sequence[Seed]) -> Seed:
+        """Choose weighted by normalized energy."""
+
+        self.assignEnergy(population)
+        norm_energy = self.normalizedEnergy(population)
+        #print(norm_energy)
+        seed: Seed = random.choices(population, weights=norm_energy)[0]
+        return seed
+
+class CountingGreyboxFuzzer(GreyboxFuzzer):
+    """Count how often individual paths are exercised."""
+
+    def reset(self):
+        """Reset path frequency"""
+        super().reset()
+        self.schedule.path_frequency = {}
+
+
+
+    def run(self, runner: FunctionCoverageRunner) -> Tuple[Any, str]:
+        """Inform scheduler about path frequency"""
+        result, outcome = super().run(runner)
+
+        path_id = getPathID(runner.coverage())
+        if path_id not in self.schedule.path_frequency:
+            self.schedule.path_frequency[path_id] = 1
+        else:
+            self.schedule.path_frequency[path_id] += 1
+
+        return(result, outcome)
+
+from fuzzingbook import Coverage as cv
+from fuzzingbook import MutationFuzzer as mf
+class MyCoverage(cv.Coverage):
+  def coverage(self) -> Set[Location]:
+    #The set of executed lines, as (function_name, line_number) pairs
+    #print(self.trace())
+    return self.trace()
+
+class MyFunctionCoverageRunner(mf.FunctionRunner):
+  def run_function(self, inp: str) -> Any:
+    with MyCoverage() as cov:
+      try:
+        result = super().run_function(inp)
+      except Exception as exc:
+        self._coverage = cov.coverage()
+        raise exc
+    self._coverage = cov.coverage()
+    return result
+  def coverage(self) -> Set[cv.Location]:
+    return self._coverage
+
 if __name__ == "__main__":
-    seed_inputs = get_initial_corpus()
-    fast_schedule = gbf.AFLFastSchedule(5)
-    line_runner = mf.FunctionCoverageRunner(entrypoint)
+  n = 300
+  seed_input = get_initial_corpus()
+  fast_schedule = AFLFastSchedule(5)
+  fast_fuzzer = CountingGreyboxFuzzer(seed_input, Mutator(), fast_schedule)
+  line_runner = MyFunctionCoverageRunner(entrypoint)
+  start = time.time()
+  fast_fuzzer.runs(line_runner, trials=n)
+  end = time.time()
+  print(fast_fuzzer.population)
+  pop_data = [inp for inp in fast_fuzzer.inputs[1:]]
+  print(pop_data)
+  all_coverage, cumu_coverage = population_coverage(pop_data, entrypoint)
+  #print(cum_coverage)
+  print(max(cumu_coverage))
+  print(line_runner.coverage())
 
-    fast_fuzzer = gbf.CountingGreyboxFuzzer(seed_inputs, gbf.Mutator(), fast_schedule)
-    fast_fuzzer.runs(line_runner, trials=999999999)
+  import matplotlib.pyplot as plt
+  plt.plot(cumu_coverage, label="Greybox")
+  plt.title('Coverage over time')
+  plt.xlabel('# of inputs')
+  plt.ylabel('lines covered')
+  plt.show()
+

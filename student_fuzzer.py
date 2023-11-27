@@ -53,7 +53,7 @@ class Mutator:
          mask=s.mask[:]
          mask.insert(pos,[1,1,1])
          temp.mask=mask
-        return temp
+         return temp
 
 
     def delete_random_character(self, s: Seed) -> str:
